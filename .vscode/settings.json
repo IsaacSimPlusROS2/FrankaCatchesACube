@@ -1,0 +1,12 @@
+{
+  "python.defaultInterpreterPath": "/home/mryan2005/miniconda3/envs/env_isaaclab/bin/python",
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.analysis.extraPaths": [
+    "/home/mryan2005/isaac-sim-standalone-5.1.0-linux-x86_64/python",
+    "/home/mryan2005/IsaacLab/source/isaaclab"
+  ],
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "information"
+  }
+}
