@@ -1,23 +1,28 @@
 from isaacsim import SimulationApp
+import os
+os.environ["OMNI_KIT_TESTS_DISABLE"] = "1"
 
 # ========== 启动 Isaac ==========
-simulation_app = SimulationApp({"headless": False})
+simulation_app = SimulationApp({
+    "headless": False,
+    "disable_rendering": False,
+    "renderer": "RayTracedLighting"
+})
 
 import omni.kit.app
 from isaacsim.core.utils.extensions import enable_extension
 
 # 先启用扩展（避免 Graph 在未初始化时崩溃）
 enable_extension("omni.graph.action")
-enable_extension("omni.syntheticdata")
-enable_extension("isaacsim.ros2.bridge")  # 新版扩展名
-enable_extension("omni.isaac.ros2_bridge")  # 兼容旧版
-enable_extension("omni.replicator.core")    # 用于 render_product
+enable_extension("isaacsim.ros2.bridge")
+enable_extension("omni.replicator.core")
 
 # 让扩展完全加载
 for _ in range(10):
     omni.kit.app.get_app().update()
 
 # ========== ROS2 Bridge ==========
+import numpy as np
 from pxr import UsdGeom
 import omni.graph.core as og
 import omni.replicator.core as rep
@@ -25,6 +30,8 @@ from pxr import UsdLux
 from isaacsim.core.api import World
 from isaacsim.core.utils.prims import create_prim
 from isaacsim.core.api.objects.cuboid import DynamicCuboid
+from omni.isaac.core.articulations import Articulation
+from omni.isaac.core.utils.types import ArticulationAction
 
 # ---------- 创建世界 ----------
 world = World(stage_units_in_meters=1.0)
@@ -36,9 +43,7 @@ FRANKA_USD = (
     "Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 )
 
-root = stage.DefinePrim("/World/FrankaRoot", "Xform")
-UsdGeom.XformCommonAPI(root).SetTranslate((0, 0, 0))
-
+franka_root = stage.DefinePrim("/World/FrankaRoot", "Xform")
 franka = stage.DefinePrim("/World/FrankaRoot/Franka", "Xform")
 franka.GetReferences().AddReference(FRANKA_USD)
 franka.Load()
@@ -101,7 +106,6 @@ og.Controller.edit(
             ("tick.outputs:tick", "camera_helper.inputs:execIn"),
         ],
         og.Controller.Keys.SET_VALUES: [
-            # 注意：这里必须是字符串 token，不要 Sdf.Path
             ("camera_helper.inputs:renderProductPath", render_product_path),
             ("camera_helper.inputs:topicName", image_topic),
             ("camera_helper.inputs:frameId", "franka_camera"),
@@ -109,9 +113,77 @@ og.Controller.edit(
     },
 )
 
+# ---------- Franka 控制 ----------
+franka_articulation = Articulation(prim_path="/World/FrankaRoot/Franka", name="franka")
+world.scene.add(franka_articulation)
+
+arm_joint_names = [
+    "panda_joint1",
+    "panda_joint2",
+    "panda_joint3",
+    "panda_joint4",
+    "panda_joint5",
+    "panda_joint6",
+    "panda_joint7",
+]
+finger_joint_names = [
+    "panda_finger_joint1",
+    "panda_finger_joint2",
+]
+
+def build_action(arm_positions, finger_position):
+    joint_positions = franka_articulation.get_joint_positions()
+    if joint_positions is None:
+        joint_positions = np.zeros(franka_articulation.num_dof)
+    joint_positions = np.array(joint_positions)
+
+    dof_names = franka_articulation.dof_names
+    dof_index = {name: i for i, name in enumerate(dof_names)}
+
+    for name, value in zip(arm_joint_names, arm_positions):
+        joint_positions[dof_index[name]] = value
+
+    for name in finger_joint_names:
+        joint_positions[dof_index[name]] = finger_position
+
+    return ArticulationAction(joint_positions=joint_positions)
+
+# 俯身、张开、夹住、抬起的关节目标
+pose_bend_down = [0.0, -0.9, 0.0, -2.0, 0.0, 1.6, 0.8]
+pose_lift_up = [0.0, -0.4, 0.0, -1.4, 0.0, 1.2, 0.8]
+gripper_open = 0.04
+gripper_close = 0.0
+
+sequence = [
+    {"name": "bend_down", "arm": pose_bend_down, "gripper": gripper_open, "frames": 140},
+    {"name": "open_gripper", "arm": pose_bend_down, "gripper": gripper_open, "frames": 40},
+    {"name": "grasp", "arm": pose_bend_down, "gripper": gripper_close, "frames": 80},
+    {"name": "lift", "arm": pose_lift_up, "gripper": gripper_close, "frames": 140},
+]
+
 # ---------- 运行 ----------
 world.reset()
+franka_articulation.initialize()
+
+step_index = 0
+step_frame = 0
+current_action = None
+
 while simulation_app.is_running():
+    if step_index < len(sequence):
+        step = sequence[step_index]
+        if step_frame == 0:
+            current_action = build_action(step["arm"], step["gripper"])
+
+        franka_articulation.apply_action(current_action)
+        step_frame += 1
+        if step_frame >= step["frames"]:
+            step_index += 1
+            step_frame = 0
+    else:
+        if current_action is not None:
+            franka_articulation.apply_action(current_action)
+
     world.step(render=True)
 
 simulation_app.close()
