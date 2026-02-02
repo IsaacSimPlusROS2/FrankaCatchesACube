@@ -69,49 +69,49 @@ create_prim("/World/GroundPlane", "Xform")
 world.scene.add_default_ground_plane()
 
 # ---------- 设置摄像头 ----------
-camera_root = create_prim("/World/Franka/CameraRoot", "Xform")
-camera_path = "/World/Franka/CameraRoot/Camera"
-camera_prim = create_prim(
-    prim_path=camera_path,
-    prim_type="Camera"
-)
+# camera_root = create_prim("/World/Franka/CameraRoot", "Xform")
+# camera_path = "/World/Franka/CameraRoot/Camera"
+# camera_prim = create_prim(
+#     prim_path=camera_path,
+#     prim_type="Camera"
+# )
 
-xform_api = UsdGeom.XformCommonAPI(camera_root)
-xform_api.SetTranslate((0.6, 0.0, 1.2))
-xform_api.SetRotate((-60.0, 0.0, 0.0))
+# xform_api = UsdGeom.XformCommonAPI(camera_root)
+# xform_api.SetTranslate((0.6, 0.0, 1.2))
+# xform_api.SetRotate((-60.0, 0.0, 0.0))
 
 # ---------- 创建 Render Product（Replicator） ----------
-render_product = rep.create.render_product(camera_path, resolution=(640, 480))
+# render_product = rep.create.render_product(camera_path, resolution=(640, 480))
 
-# 不同版本返回对象不同，优先取 .path
-render_product_path = getattr(render_product, "path", None)
-if render_product_path is None:
-    render_product_path = str(render_product)
+# # 不同版本返回对象不同，优先取 .path
+# render_product_path = getattr(render_product, "path", None)
+# if render_product_path is None:
+#     render_product_path = str(render_product)
 
-print("render_product_path =", render_product_path)
-print("RenderProduct valid:", stage.GetPrimAtPath(render_product_path).IsValid())
+# print("render_product_path =", render_product_path)
+# print("RenderProduct valid:", stage.GetPrimAtPath(render_product_path).IsValid())
 
 # ---------- ROS2 图像发布（OmniGraph 方式） ----------
-image_topic = "/franka/camera/image_raw"
+# image_topic = "/franka/camera/image_raw"
 
-graph_path = "/ROS2CameraGraph"
-og.Controller.edit(
-    {"graph_path": graph_path, "evaluator_name": "execution"},
-    {
-        og.Controller.Keys.CREATE_NODES: [
-            ("tick", "omni.graph.action.OnPlaybackTick"),
-            ("camera_helper", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-        ],
-        og.Controller.Keys.CONNECT: [
-            ("tick.outputs:tick", "camera_helper.inputs:execIn"),
-        ],
-        og.Controller.Keys.SET_VALUES: [
-            ("camera_helper.inputs:renderProductPath", render_product_path),
-            ("camera_helper.inputs:topicName", image_topic),
-            ("camera_helper.inputs:frameId", "franka_camera"),
-        ],
-    },
-)
+# graph_path = "/ROS2CameraGraph"
+# og.Controller.edit(
+#     {"graph_path": graph_path, "evaluator_name": "execution"},
+#     {
+#         og.Controller.Keys.CREATE_NODES: [
+#             ("tick", "omni.graph.action.OnPlaybackTick"),
+#             ("camera_helper", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+#         ],
+#         og.Controller.Keys.CONNECT: [
+#             ("tick.outputs:tick", "camera_helper.inputs:execIn"),
+#         ],
+#         og.Controller.Keys.SET_VALUES: [
+#             ("camera_helper.inputs:renderProductPath", render_product_path),
+#             ("camera_helper.inputs:topicName", image_topic),
+#             ("camera_helper.inputs:frameId", "franka_camera"),
+#         ],
+#     },
+# )
 
 # ---------- Franka 控制 ----------
 franka_articulation = Articulation(prim_path="/World/FrankaRoot/Franka", name="franka")
@@ -134,7 +134,8 @@ finger_joint_names = [
 def build_action(arm_positions, finger_position):
     joint_positions = franka_articulation.get_joint_positions()
     if joint_positions is None:
-        joint_positions = np.zeros(franka_articulation.num_dof)
+        return None   # ⬅️ 关键：直接放弃这一帧
+
     joint_positions = np.array(joint_positions)
 
     dof_names = franka_articulation.dof_names
@@ -146,7 +147,11 @@ def build_action(arm_positions, finger_position):
     for name in finger_joint_names:
         joint_positions[dof_index[name]] = finger_position
 
-    return ArticulationAction(joint_positions=joint_positions)
+    return ArticulationAction(
+        joint_positions=joint_positions,
+        joint_indices=np.arange(len(joint_positions))  # ⭐关键
+    )
+
 
 # 俯身、张开、夹住、抬起的关节目标
 pose_bend_down = [0.0, -0.9, 0.0, -2.0, 0.0, 1.6, 0.8]
@@ -163,19 +168,50 @@ sequence = [
 
 # ---------- 运行 ----------
 world.reset()
+
+# 2. 预先跑几帧，让 PhysX / ArticulationView 真正建立起来
+# 2. 先跑一小段时间，让 Simulation View 完全创建
+for _ in range(50):
+    world.step(render=True)
+
+# 3. 再初始化 articulation（有的版本里 initialize 需要在世界运行后调用更稳）
 franka_articulation.initialize()
+
+# 4. 再跑几帧，确保 controller/view 绑定完成
+for _ in range(10):
+    world.step(render=True)
+
+print("Num DOF:", franka_articulation.num_dof)
+print("DOF names:", franka_articulation.dof_names)
+print("Joint positions init:", franka_articulation.get_joint_positions())
 
 step_index = 0
 step_frame = 0
 current_action = None
 
+warmup = True
+warmup_steps = 20
+
 while simulation_app.is_running():
+
+    if warmup:
+        # 让仿真多跑几步，直到关节读取稳定
+        jp = franka_articulation.get_joint_positions()
+        if jp is not None:
+            warmup_steps -= 1
+        if warmup_steps <= 0:
+            warmup = False
+        world.step(render=True)
+        continue
+     
     if step_index < len(sequence):
         step = sequence[step_index]
         if step_frame == 0:
             current_action = build_action(step["arm"], step["gripper"])
 
-        franka_articulation.apply_action(current_action)
+        if current_action is not None and current_action.joint_positions is not None:
+            franka_articulation.apply_action(current_action)
+
         step_frame += 1
         if step_frame >= step["frames"]:
             step_index += 1
