@@ -1,5 +1,5 @@
 # ============================================================
-# Isaac Sim 5.1 | Franka Panda: 先张开 -> 俯探 -> 抓取
+# Isaac Sim 5.1 | Franka Panda: 搬运物体到B，随后机械臂移动到C
 # ============================================================
 
 import os
@@ -28,7 +28,6 @@ world.scene.add_default_ground_plane()
 # ------------------------------------------------------------
 # 2. Cube（目标物体）
 # ------------------------------------------------------------
-# Cube 的中心位置。Cube 高度 0.05，放在 Z=0.025 刚好贴地
 cube_initial_pos = np.array([0.5, 0.0, 0.025])
 cube_size = 0.05
 
@@ -36,12 +35,13 @@ cube = DynamicCuboid(
     prim_path="/World/Cube",
     name="cube",
     position=cube_initial_pos,
-    size=cube_size
+    size=cube_size,
+    color=np.array([1, 0, 0])
 )
 world.scene.add(cube)
 
 # ------------------------------------------------------------
-# 3. Franka Panda（保留您的加载逻辑）
+# 3. Franka Panda 加载逻辑
 # ------------------------------------------------------------
 stage = world.stage
 FRANKA_USD = (
@@ -54,7 +54,6 @@ franka_prim = stage.DefinePrim("/World/FrankaRoot/Franka", "Xform")
 franka_prim.GetReferences().AddReference(FRANKA_USD)
 franka_prim.Load()
 
-# 包装为机器人对象
 franka_robot = world.scene.add(
     Franka(
         prim_path="/World/FrankaRoot/Franka", 
@@ -67,7 +66,6 @@ franka_robot = world.scene.add(
 # ------------------------------------------------------------
 world.reset()
 
-# 使用 5.1 正确的初始化方式：直接传入 gripper 对象
 controller = PickPlaceController(
     name="pick_place_controller",
     gripper=franka_robot.gripper,
@@ -78,9 +76,17 @@ controller = PickPlaceController(
 # 5. 主循环逻辑
 # ------------------------------------------------------------
 task_started = False
-warmup_steps = 0  # 用于“先张开”的计时器
+warmup_steps = 0 
+task_phase = 0 
+# 0: 搬运 A -> B (物体随动)
+# 1: 移动 B -> C (空手移动)
+# 2: 完成
 
-print(">>> 场景准备就绪，请点击 Play 开始...")
+# 坐标定义
+target_place_pos = np.array([0.0, 0.5, 0.05]) # B点：物体放置处
+empty_move_pos   = np.array([0.5, 0.0, 0.5])  # C点：机械臂最终去向 (高处)
+
+print(">>> 场景准备就绪，点击 Play 开始...")
 
 while simulation_app.is_running():
     world.step(render=True)
@@ -88,49 +94,76 @@ while simulation_app.is_running():
     if world.is_playing():
         # --- 初始化阶段 ---
         if not task_started:
-            print(">>> 任务开始：重置场景...")
+            print(">>> 任务开始：重置...")
             world.reset()
-            cube.set_world_pose(position=cube_initial_pos, orientation=np.array([1,0,0,0]))
+            cube.set_world_pose(position=cube_initial_pos)
             controller.reset()
             task_started = True
-            warmup_steps = 0 # 重置计时器
+            warmup_steps = 0 
+            task_phase = 0
 
-        # --- 步骤1: 强制先张开夹爪 (持续 60 帧) ---
+        # ====================================================
+        # 预备: 张开夹爪
+        # ====================================================
         if warmup_steps < 60:
-            # 获取“张开”的动作指令
-            # action="open" 会施加力让夹爪打开
-            open_action = franka_robot.gripper.forward(action="open")
-            franka_robot.apply_action(open_action)
-            
-            if warmup_steps == 0:
-                print(">>> 步骤1: 张开夹爪...")
-            
+            franka_robot.apply_action(franka_robot.gripper.forward(action="open"))
             warmup_steps += 1
-            continue  # 跳过下面的代码，直到 warmup 完成
+            continue 
 
-        # --- 步骤2: 执行自动抓取流程 ---
-        # 控制器会自动处理：移动到上方(Approach) -> 垂直下降(Descend) -> 闭合(Grasp) -> 提升(Lift)
-        
-        current_cube_pos, _ = cube.get_world_pose()
-        
-        # 这里的 picking_position 是抓取点
-        # Cube中心在 0.025，我们稍微往下一丁点(0.02)或者正中心，确保手指能包住物体
-        # 控制器内部逻辑会先移动到 target + offset (上方)，然后慢慢降落
-        actions = controller.forward(
-            picking_position=current_cube_pos,
-            placing_position=current_cube_pos + np.array([0, 0, 0.2]),
-            current_joint_positions=franka_robot.get_joint_positions()
-        )
+        # ====================================================
+        # 阶段 0: 搬运物体 A -> B
+        # ====================================================
+        if task_phase == 0:
+            current_cube_pos, _ = cube.get_world_pose()
+            
+            # 这是一个完整的抓取-放置动作
+            actions = controller.forward(
+                picking_position=current_cube_pos,
+                placing_position=target_place_pos,
+                current_joint_positions=franka_robot.get_joint_positions()
+            )
 
-        if actions is not None:
-            franka_robot.apply_action(actions)
-        
-        if controller.is_done():
-            # 任务完成，保持最后姿态
+            if actions is not None:
+                franka_robot.apply_action(actions)
+            
+            if controller.is_done():
+                print(f"✅ 搬运完成，物体留在 B 点。")
+                controller.reset() # 必须重置以进行下一次移动
+                task_phase = 1 
+
+        # ====================================================
+        # 阶段 1: 机械臂移动 B -> C (不带物体)
+        # ====================================================
+        elif task_phase == 1:
+            # 核心逻辑：
+            # 我们再次使用 controller，但将 picking_position 和 placing_position 
+            # 都设为目标 C 点。这会欺骗控制器让它直接飞过去。
+            # 或者更简单：设定 pick 为当前位置，place 为目标位置，但因为物体已经不在那了，
+            # 机械臂只是在空中执行一套“假装抓取并放下”的动作。
+            
+            # 最干净的方法：让控制器执行一个从“当前位置”到“C点”的任务
+            actions = controller.forward(
+                picking_position=empty_move_pos, # 直接去C点抓
+                placing_position=empty_move_pos, # 就在C点放
+                current_joint_positions=franka_robot.get_joint_positions()
+            )
+            
+            if actions is not None:
+                franka_robot.apply_action(actions)
+
+            if controller.is_done():
+                print(f"✅ 机械臂已到达 C 点。")
+                task_phase = 2
+
+        # ====================================================
+        # 阶段 2: 停在 C 点
+        # ====================================================
+        elif task_phase == 2:
             pass
 
     elif world.is_stopped():
         task_started = False
         warmup_steps = 0
+        task_phase = 0
 
 simulation_app.close()
